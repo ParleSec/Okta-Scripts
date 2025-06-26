@@ -1,301 +1,307 @@
-﻿<#
+<#
 .SYNOPSIS
-  Exports all members of a single Okta group (by name or ID) into a CSV, including any number of custom profile attributes.
+  Export Okta group members to CSV with interactive attribute selection.
 
 .DESCRIPTION
-  • Prompts for: Okta Org URL, API token, group (name or 00g… ID), custom attributes, output path.
-  • Columns: userId, username, activated, created, lastLogin + any custom attributes.
-  • Joins array-typed attributes with a semicolon.
-  • Shows a progress bar as it pages through Okta (200 records per call).
-  • Requires PowerShell 5.1+ or PowerShell 7+.
-  • Handles pagination, stopping when Okta returns no rel="next" link or an empty page.
+  Exports Okta group members with:
+  - Interactive attribute selection (checkbox-style)
+  - Automatic attribute discovery
+  - Custom attribute support
+  - Column ordering matching Okta admin console
 
 .PARAMETER Org
-  (Optional) The full Okta org URL, e.g. https://acme.okta.com.
-  If omitted, the script prompts for it (or uses $Env:OKTA_ORG).
+  Okta org (e.g., "acme" or "https://acme.okta.com")
 
-.PARAMETER Token
-  (Optional) A minimally read-only API token (with okta.users.read & okta.groups.read).
-  If omitted, the script prompts (or uses $Env:OKTA_TOKEN).
+.PARAMETER Token  
+  API token with user/group read permissions
 
 .PARAMETER Group
-  (Optional) The group name (partial match) or 00g… ID. If omitted, the script will prompt.
+  Group name or ID (00g...)
 
-.PARAMETER ProfileAttrs
-  (Optional) A string array of profile-attribute names (e.g. groupSettings,CostCenter).
-  If omitted, the script prompts for them; otherwise those values are used.
+.PARAMETER QuickExport
+  Skip selection and use Okta default columns
 
-.PARAMETER CsvPath
-  (Optional) Full path for the CSV. If omitted, the script prompts and defaults to "OktaGroup_<timestamp>.csv" in the working directory.
+.PARAMETER Output
+  Output file path (defaults to GroupName_timestamp.csv)
 
 .EXAMPLE
-  # Fully interactive (no args):
   .\OktaGroupExport.ps1
-
+  
 .EXAMPLE
-  # Non-interactive (all args provided):
-  $env:OKTA_ORG   = "https://acme.okta.com"
-  $env:OKTA_TOKEN = "00aBcDeF..."
-  .\OktaGroupExport.ps1 `
-    -Group "Working Group" `
-    -ProfileAttrs "groupSettings","CostCenter" `
-    -CsvPath "C:\oktaExports\workgroup.csv"
-
-.NOTES
-  • This script is designed to run entirely locally: no external modules or binaries.
+  .\OktaGroupExport.ps1 -Group "Sales" -QuickExport
 #>
 
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $false)]
-    [string] $Org,
-
-    [Parameter(Mandatory = $false)]
-    [string] $Token,
-
-    [Parameter(Mandatory = $false)]
-    [string] $Group,
-
-    [Parameter(Mandatory = $false)]
-    [string[]] $ProfileAttrs,
-
-    [Parameter(Mandatory = $false)]
-    [string] $CsvPath
+    [string]$Org = $env:OKTA_ORG,
+    [string]$Token = $env:OKTA_TOKEN,
+    [string]$Group,
+    [switch]$QuickExport,
+    [string]$Output
 )
 
-#region Helper functions
-
-function Read-NonEmpty {
-    param(
-        [string] $Prompt,
-        [switch] $Secure
-    )
-    do {
-        if ($Secure) {
-            $v = Read-Host $Prompt -AsSecureString |
-                 ConvertFrom-SecureString -AsPlainText
-        }
-        else {
-            $v = Read-Host $Prompt
-        }
-        if (-not $v) {
-            Write-Host "  ⇒ value required." -ForegroundColor Red
-        }
-    } until ($v)
-    return $v
+# Column display names
+$ColumnNames = @{
+    id = "User Id"; status = "Status"; login = "Username"; email = "Primary email"
+    firstName = "First name"; lastName = "Last name"; displayName = "Display name"
+    secondEmail = "Secondary email"; primaryPhone = "Primary phone"; mobilePhone = "Mobile phone"
+    title = "Title"; department = "Department"; manager = "Manager"; employeeNumber = "Employee ID"
+    created = "Created date"; activated = "Activated date"; lastLogin = "Last login date"
+    lastUpdated = "Last updated"; passwordChanged = "Password changed"; statusChanged = "Status changed date"
 }
 
-function Invoke-OktaRest {
-    param(
-        [string] $Uri,
-        [string] $Token
-    )
+# Default selections (matching Okta export)
+$DefaultSelected = @('id','status','login','firstName','lastName','email')
 
-    $headers = @{ Authorization = "SSWS $Token" }
+function Invoke-OktaApi {
+    param($Uri)
+    $headers = @{ Authorization = "SSWS $Token"; Accept = "application/json" }
     try {
-        $result = Invoke-RestMethod `
-                   -Method Get `
-                   -Uri $Uri `
-                   -Headers $headers `
-                   -ErrorAction Stop `
-                   -ResponseHeadersVariable respHdrs
-        # Preserve the Link header for pagination
-        $script:LastLinkHeader = $respHdrs['Link']
-        return $result
-    }
-    catch {
-        throw "Request failed: $($_.Exception.Message)"
+        $response = Invoke-WebRequest -Uri $Uri -Headers $headers -UseBasicParsing -ErrorAction Stop
+        $script:NextLink = if ($response.Headers.Link -match '<([^>]+)>;\s*rel="next"') { $matches[1] }
+        return ($response.Content | ConvertFrom-Json)
+    } catch {
+        throw if ($_.Exception.Response.StatusCode -eq 401) { "Invalid API token" } else { $_.Exception.Message }
     }
 }
 
-function Get-NextLink {
-    param(
-        [string] $LinkHeader
-    )
-    if (-not $LinkHeader) { return $null }
-
-    # Match only the rel="next" URL segment
-    if ($LinkHeader -match '<([^>]+)>;\s*rel="next"') {
-        return $matches[1]
+function Show-AttributeMenu {
+    param($Available, $Selected)
+    
+    Clear-Host
+    Write-Host "`nSELECT ATTRIBUTES TO EXPORT" -ForegroundColor Cyan
+    Write-Host "===========================" -ForegroundColor Cyan
+    Write-Host "Use numbers to toggle, 'ALL', 'NONE', or Enter to continue`n"
+    
+    $menu = @{}
+    $i = 1
+    
+    # Group attributes by type
+    $groups = [ordered]@{
+        "Basic Info" = @('id','status','login','email','firstName','lastName','displayName')
+        "Contact" = @('primaryPhone','mobilePhone','secondEmail')
+        "Organization" = @('title','department','manager','employeeNumber')
+        "Dates" = @('created','activated','lastLogin','lastUpdated','passwordChanged','statusChanged')
+        "Custom" = @()
     }
-    return $null
-}
-
-#endregion
-
-trap {
-    Write-Host "`n⚠️  Script aborted: $($_.Exception.Message)" -ForegroundColor Red
-    break
-}
-
-Write-Host "`n=== Okta Group Exporter ===`n" -ForegroundColor Cyan
-
-#region 1. Resolve Org & Token
-
-if (-not $Org) {
-    if ($Env:OKTA_ORG) {
-        $Org = $Env:OKTA_ORG
-    }
-    else {
-        $Org = Read-NonEmpty "Okta Org URL (https://org.okta.com):"
-    }
-}
-# Remove any trailing slash
-$Org = $Org.TrimEnd('/')
-
-if (-not $Token) {
-    if ($Env:OKTA_TOKEN) {
-        $Token = $Env:OKTA_TOKEN
-    }
-    else {
-        $Token = Read-NonEmpty "API token (will not echo):" -Secure
-    }
-}
-
-#endregion
-
-#region 2. Resolve Group ID & Name
-
-if (-not $Group) {
-    $Group = Read-NonEmpty "Group name *or* groupID to export:"
-}
-
-try {
-    if ($Group -notmatch '^00g') {
-        $escaped   = [uri]::EscapeDataString($Group)
-        $searchUri = "$Org/api/v1/groups?q=$escaped"
-        $match     = Invoke-OktaRest $searchUri $Token | Select-Object -First 1
-
-        if (-not $match) {
-            throw "No group found matching '$Group'."
+    
+    foreach ($groupName in $groups.Keys) {
+        $attrs = $groups[$groupName] | Where-Object { $_ -in $Available -or $groupName -eq "Custom" }
+        if ($attrs.Count -eq 0 -and $groupName -ne "Custom") { continue }
+        
+        Write-Host "`n$groupName`:" -ForegroundColor Yellow
+        
+        if ($groupName -eq "Custom") {
+            # Show other discovered attributes
+            $shown = $groups.Values | ForEach-Object { $_ }
+            $custom = $Available | Where-Object { $_ -notin $shown }
+            foreach ($attr in $custom) {
+                $checked = if ($attr -in $Selected) { "[X]" } else { "[ ]" }
+                $display = if ($ColumnNames[$attr]) { $ColumnNames[$attr] } else { $attr }
+                Write-Host ("  {0} {1,2}. {2}" -f $checked, $i, $display)
+                $menu[$i] = $attr
+                $i++
+            }
+        } else {
+            foreach ($attr in $attrs) {
+                $checked = if ($attr -in $Selected) { "[X]" } else { "[ ]" }
+                $display = $ColumnNames[$attr]
+                Write-Host ("  {0} {1,2}. {2}" -f $checked, $i, $display)
+                $menu[$i] = $attr
+                $i++
+            }
         }
-
-        $groupId   = $match.id
-        $groupName = $match.profile.name
     }
-    else {
-        $groupId   = $Group
-        $groupName = $Group
-    }
-
-    Write-Host "`n✔ Using group: $groupName ($groupId)" -ForegroundColor Green
-}
-catch {
-    Write-Host $_.Exception.Message -ForegroundColor Red
-    exit 1
+    
+    return $menu
 }
 
-#endregion
+# Main
+Clear-Host
+Write-Host "OKTA GROUP EXPORT TOOL" -ForegroundColor Cyan
+Write-Host "======================" -ForegroundColor Cyan
 
-#region 3. Prompt for Custom Attributes (if none provided)
-
-if (-not $ProfileAttrs) {
-    $attrsInput = Read-Host "Custom profile attributes (comma-sep, blank for none):"
-    if ($attrsInput) {
-        $ProfileAttrs = $attrsInput -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ }
-    }
-    else {
-        # If blank, leave $ProfileAttrs as $null or empty array
-        $ProfileAttrs = @()
-    }
+# Get inputs
+if (!$Org) { $Org = Read-Host "`nOkta org (e.g., 'acme' or 'acme.okta.com')" }
+$OktaUrl = $Org.Trim()
+if ($OktaUrl -notmatch '^https?://') {
+    $OktaUrl = if ($OktaUrl -match '\.okta\.com') { "https://$OktaUrl" } else { "https://$OktaUrl.okta.com" }
 }
 
-#endregion
-
-#region 4. Build Output Path
-
-if (-not $CsvPath) {
-    $ts      = Get-Date -Format 'yyyyMMdd_HHmmss'
-    $default = "OktaGroup_${ts}.csv"
-    $input   = Read-Host "Save CSV as (default $default)"
-    if ($input) {
-        $CsvPath = $input
-    }
-    else {
-        $CsvPath = $default
-    }
+if (!$Token) { 
+    $secure = Read-Host "API token" -AsSecureString
+    $BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+    $Token = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
+    [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR)
 }
 
-#endregion
+if (!$Group) { $Group = Read-Host "Group name or ID" }
 
-#region 5. Fetch Members & Stream to CSV
-
-# 5.1 Prepare and write header row
-$baseCols   = @('userId','username','activated','created','lastLogin')
-$headerCols = $baseCols + $ProfileAttrs
-$headerLine = $headerCols -join ','
-
-# Write or overwrite the CSV file with the header
-$headerLine | Out-File -FilePath $CsvPath -Encoding UTF8
-
-# 5.2 Initialize paging
-$count   = 0
-$pageUri = "$Org/api/v1/groups/$groupId/users?limit=200"
-
-Write-Progress -Activity "Fetching users" -Status "0 users so far…" -PercentComplete 0
-
-while ($pageUri) {
-    try {
-        $page = Invoke-OktaRest $pageUri $Token
-    }
-    catch {
-        Write-Host $_.Exception.Message -ForegroundColor Red
-        exit 1
-    }
-
-    # If Okta ever returns an empty array, break out
-    if ($null -eq $page -or $page.Count -eq 0) {
-        break
-    }
-
-    # 5.3 Build a PSCustomObject array for this page
-    $objects = foreach ($u in $page) {
-        $obj = [ordered]@{
-            userId    = $u.id
-            username  = $u.profile.login
-            activated = $u.activated
-            created   = $u.created
-            lastLogin = $u.lastLogin
+# Find group
+Write-Host "`nSearching..." -ForegroundColor Gray
+if ($Group -match '^00g') {
+    $groupData = Invoke-OktaApi "$OktaUrl/api/v1/groups/$Group"
+    $groupId = $Group
+    $groupName = $groupData.profile.name
+} else {
+    $groups = Invoke-OktaApi "$OktaUrl/api/v1/groups?q=$([uri]::EscapeDataString($Group))&limit=10"
+    if ($groups.Count -eq 0) { throw "No groups found" }
+    
+    if ($groups.Count -eq 1) {
+        $groupId = $groups[0].id
+        $groupName = $groups[0].profile.name
+    } else {
+        Write-Host "`nMultiple groups found:" -ForegroundColor Yellow
+        for ($i = 0; $i -lt $groups.Count; $i++) {
+            Write-Host "  $($i+1). $($groups[$i].profile.name)"
         }
-        foreach ($a in $ProfileAttrs) {
-            $val = $u.profile.$a
-            if    ($val -is [array]) { $val = $val -join ';' }
-            elseif (-not $val)       { $val = '' }
-            $obj[$a] = $val
-        }
-        [pscustomobject]$obj
+        $choice = Read-Host "Select number"
+        $selected = $groups[[int]$choice - 1]
+        $groupId = $selected.id
+        $groupName = $selected.profile.name
     }
-
-    # 5.4 Append these rows to the CSV (no header on subsequent calls)
-    $objects | Export-Csv -NoTypeInformation -Append -Path $CsvPath -Encoding UTF8
-
-    # 5.5 Update progress
-    $count += $page.Count
-    Write-Progress -Activity "Fetching users" `
-                   -Status  "$count users so far…" `
-                   -PercentComplete 0
-
-    # 5.6 Get next link (if any)
-    $pageUri = Get-NextLink $script:LastLinkHeader
 }
-Write-Progress -Activity "Fetching users" -Completed
+Write-Host "✓ Group: $groupName" -ForegroundColor Green
 
-# If no rows were written beyond the header, warn and exit.
-if ($count -eq 0) {
-    Write-Host "No users found in the group." -ForegroundColor Yellow
-    exit 0
+# Discover available attributes
+Write-Host "Discovering attributes..." -ForegroundColor Gray
+$sample = Invoke-OktaApi "$OktaUrl/api/v1/groups/$groupId/users?limit=10"
+$available = @('id','status','created','activated','lastLogin','lastUpdated','passwordChanged','statusChanged')
+if ($sample.Count -gt 0) {
+    $available += @($sample[0].profile.PSObject.Properties.Name)
+    # Check for more profile attributes across all samples
+    foreach ($user in $sample | Select-Object -Skip 1) {
+        $user.profile.PSObject.Properties.Name | Where-Object { $_ -notin $available } | ForEach-Object { $available += $_ }
+    }
+}
+$available = $available | Select-Object -Unique | Sort-Object
+
+# Select attributes
+if ($QuickExport) {
+    $selectedAttrs = $DefaultSelected
+} else {
+    $selected = [System.Collections.ArrayList]@($DefaultSelected)
+    $menu = Show-AttributeMenu -Available $available -Selected $selected
+    
+    while ($true) {
+        $input = Read-Host "`nToggle"
+        if ([string]::IsNullOrWhiteSpace($input)) { break }
+        
+        switch ($input.ToUpper()) {
+            'ALL' { 
+                $selected.Clear()
+                $selected.AddRange($menu.Values)
+                Write-Host "All selected" -ForegroundColor Green
+            }
+            'NONE' { 
+                $selected.Clear()
+                Write-Host "All cleared" -ForegroundColor Yellow
+            }
+            default {
+                $nums = $input -split ',' | ForEach-Object { 
+                    if ($_ -match '^\d+$') { [int]$_ }
+                    elseif ($_ -match '^(\d+)-(\d+)$') { [int]$matches[1]..[int]$matches[2] }
+                } | Where-Object { $_ }
+                
+                foreach ($num in $nums) {
+                    if ($menu.ContainsKey($num)) {
+                        if ($menu[$num] -in $selected) { $selected.Remove($menu[$num]) }
+                        else { [void]$selected.Add($menu[$num]) }
+                    }
+                }
+            }
+        }
+        
+        $menu = Show-AttributeMenu -Available $available -Selected $selected
+    }
+    
+    # Add custom attributes
+    Write-Host "`nAdd custom attributes? (comma-separated, or Enter to skip)" -ForegroundColor Yellow
+    Write-Host "Example: costCenter,building,customField1" -ForegroundColor Gray
+    $custom = Read-Host "Custom"
+    if ($custom) {
+        $custom -split ',' | ForEach-Object { 
+            $attr = $_.Trim()
+            if ($attr -and $attr -notin $selected) { [void]$selected.Add($attr) }
+        }
+    }
+    
+    $selectedAttrs = $selected
 }
 
-#endregion
+if ($selectedAttrs.Count -eq 0) { throw "No attributes selected" }
 
-#region 6. Completion Message
-
-try {
-    Write-Host "`n✅  CSV written to '$CsvPath'  ($count users)" -ForegroundColor Green
+# Order attributes logically
+$ordered = @()
+$order = @('id','firstName','lastName','displayName','login','email','status','title','department','manager',
+           'primaryPhone','mobilePhone','employeeNumber','created','activated','lastLogin')
+foreach ($attr in $order) {
+    if ($attr -in $selectedAttrs) { $ordered += $attr }
 }
-catch {
-    Write-Host "`n❌  Could not write CSV: $($_.Exception.Message)" -ForegroundColor Red
-    exit 1
+foreach ($attr in $selectedAttrs) {
+    if ($attr -notin $ordered) { $ordered += $attr }
+}
+$selectedAttrs = $ordered
+
+# Set output file
+if (!$Output) {
+    $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $Output = "$($groupName -replace '[^\w]','_')_$timestamp.csv"
 }
 
-#endregion
+# Build headers
+$headers = @()
+foreach ($attr in $selectedAttrs) {
+    $headers += if ($ColumnNames[$attr]) { $ColumnNames[$attr] } else { $attr }
+}
+
+# Export users
+Write-Host "`nExporting $($selectedAttrs.Count) attributes..." -ForegroundColor Gray
+$csv = [System.Text.StringBuilder]::new()
+[void]$csv.AppendLine(($headers | ForEach-Object { "`"$_`"" }) -join ',')
+
+$count = 0
+$pageUrl = "$OktaUrl/api/v1/groups/$groupId/users?limit=200"
+$startTime = Get-Date
+
+while ($pageUrl) {
+    $users = Invoke-OktaApi $pageUrl
+    if ($users.Count -eq 0) { break }
+    
+    foreach ($user in $users) {
+        $row = @()
+        foreach ($attr in $selectedAttrs) {
+            $value = if ($attr -in @('id','status','created','activated','lastLogin','lastUpdated','passwordChanged','statusChanged')) {
+                $user.$attr
+            } else {
+                $user.profile.$attr
+            }
+            
+            if ($null -eq $value) { $value = '' }
+            elseif ($value -is [datetime]) { $value = $value.ToString('yyyy-MM-dd HH:mm:ss') }
+            elseif ($value -is [array]) { $value = $value -join ';' }
+            else { $value = $value.ToString() }
+            
+            if ($value -match '[",\r\n]') { $value = "`"$($value -replace '"','""')`"" }
+            $row += $value
+        }
+        [void]$csv.AppendLine($row -join ',')
+        $count++
+    }
+    
+    Write-Progress -Activity "Exporting users" -Status "$count users" -PercentComplete -1
+    $pageUrl = $script:NextLink
+}
+
+# Save file
+[System.IO.File]::WriteAllText($Output, $csv.ToString(), [System.Text.Encoding]::UTF8)
+Write-Progress -Activity "Exporting users" -Completed
+
+# Summary
+$duration = [Math]::Round(((Get-Date) - $startTime).TotalSeconds, 1)
+Write-Host "`n✓ EXPORT COMPLETE" -ForegroundColor Green
+Write-Host "  File: $Output"
+Write-Host "  Users: $count"
+Write-Host "  Columns: $($selectedAttrs.Count)"
+Write-Host "  Time: ${duration}s"
+Write-Host "  Size: $([Math]::Round((Get-Item $Output).Length / 1KB, 1))KB"
